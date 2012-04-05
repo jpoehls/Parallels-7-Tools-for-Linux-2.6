@@ -1,0 +1,543 @@
+#!/bin/bash
+####################################################################################################
+# @file install
+#
+# Perform installation, deinstallation or upgrade of Parallels Guest Tools for Linux.
+#
+# @author ayegorov@
+# @author owner is alexg@
+#
+# Copyright (c) 2005-2008 Parallels Software International, Inc.
+# All rights reserved.
+# http://www.parallels.com
+####################################################################################################
+
+PATH=/sbin:/bin:/usr/sbin:/usr/bin${PATH:+:$PATH}
+
+BASE_DIR="$(dirname "$0")"
+INSTALLER="installer"
+KMODS="kmods"
+TOOLS="tools"
+ISTATUS="prl_istatus"
+BLACKLIST="blacklist-parallels.conf"
+BLACKLIST_OLD="blacklist-parallels"
+
+# Definition of installation package files
+INSTALLER_DIR="$BASE_DIR/$INSTALLER"
+KMODS_DIR="$BASE_DIR/$KMODS"
+TOOLS_DIR="$BASE_DIR/$TOOLS"
+INSTALL="$BASE_DIR/install"
+VERSION="$BASE_DIR/version"
+
+# Defnition of GUI installer
+GUI_INSTALLER="$INSTALLER_DIR/installer"
+X32=x86_32
+X64=x86_64
+
+# Definition of extra installers
+INSTALL_KMODS="$INSTALLER_DIR/install-kmods.sh"
+INSTALL_TOOLS="$INSTALLER_DIR/install-tools.sh"
+
+# Definition of target installation files
+INSTALL_DIR="/usr/lib/parallels-tools"
+INSTALL_DIRS="$INSTALL_DIR                      \
+              /usr/lib/parallels-server-tools   \
+              /usr/lib/parallels"
+MODPROBED_DIR="/etc/modprobe.d"
+MODPROBE_CONF="/etc/modprobe.conf"
+ALIAS_NE2K_OFF="install ne2k-pci /bin/true # replaced by prl_eth"
+ALIAS_NE2K_OVERRIDE="install ne2k-pci modprobe -q prl_eth || modprobe -i ne2k-pci"
+MODPROBE_PRL_ETH_CONF="$MODPROBED_DIR/prl_eth.conf"
+
+INSTALL_DIR_KMODS="$INSTALL_DIR/$KMODS"
+INSTALL_DIR_TOOLS="$INSTALL_DIR/$TOOLS"
+
+# Definition of backup directory
+BACKUP_DIR="$INSTALL_DIR/.backup"
+
+# Definition of LOG file
+LOG="/var/log/parallels-tools-install.log"
+
+# Definition of flags
+FLAG_CHECK_ASK="Yes"
+if [ -z "$FLAG_CHECK_GUI" ]; then
+	FLAG_CHECK_GUI=""
+fi
+
+UPDATE_MODE=0
+
+####################################################################################################
+# Definition of error codes
+####################################################################################################
+
+E_NOERROR=0
+E_NOLINUX=101
+E_NOPERM=102
+E_NOARGS=103
+E_WARG=104
+E_NOVER=105
+E_NOTOOLS=106
+E_NOANS=148
+E_NOPKG=149
+
+####################################################################################################
+# Show error
+####################################################################################################
+
+perror() {
+	echo $1 1>&2
+}
+
+####################################################################################################
+# Help message
+####################################################################################################
+
+usage() {
+	echo "Perform installation, deinstallation or upgrade of Parallels Guest Tools for Linux"
+	echo "Usage: $0 [option] [--skip-rclocal-restore]"
+	echo "       -i, --install           install or upgrade Parallels tools in Guest OS"
+	echo "       --install-unattended    perform unattended installation or upgrade of Parallels tools"
+	echo "       --install-unattended-with-deps"
+	echo "                               perform unattended installation or upgrade of Parallels tools"
+	echo "                               with downloading required packages"
+	echo "       -r, --remove            remove Parallels tools from Guest OS"
+	echo "       -v, --version           output version information"
+	echo "       -h, --help              display this help message"
+	echo "       --skip-rclocal-restore  flag to disable restoring /etc/rc.local broken by unsuccessful"
+	echo "                               express installation (for Ubuntu systems)"
+}
+
+####################################################################################################
+# Check requirements to run this script
+####################################################################################################
+
+check_requirements() {
+	if [ "x$(uname -s)" != "xLinux" ]; then
+		perror "Error: these Parallels Guest Tools can be installed on Linux guest OS only."
+		perror "Please press 'Enter' to exit from Parallels Installer."
+		read
+		exit $E_NOLINUX
+	fi
+
+	if [ "x$(id -u)" != "x0" ]; then
+		perror "Error: you do not have permissions to run this script."
+		perror "Please press 'Enter' to exit from Parallels Installer."
+		read
+		exit $E_NOPERM
+	fi
+}
+
+check_restrictions() {
+	# Do not check restrictions if and only if
+	# we are installing tools from GUI application
+	if [ -z "$FLAG_CHECK_GUI" ]; then
+		# Perform basic checks
+		check_requirements
+
+		# Check kernel space modules
+		FLAG_CHECK_ASK="$FLAG_CHECK_ASK" "$INSTALL_KMODS" --check "$KMODS_DIR" "$BACKUP_DIR" "$LOG"
+		result=$?
+		[ $result -ne $E_NOERROR ] && return $result
+
+		# Check user space modules
+		FLAG_CHECK_ASK="$FLAG_CHECK_ASK" "$INSTALL_TOOLS" --check
+		result=$?
+		[ $result -ne $E_NOERROR ] && return $result
+	fi
+
+	return $E_NOERROR
+}
+
+####################################################################################################
+# Remove Guest Tools
+####################################################################################################
+
+remove_gt3() {
+	daemon=""
+	sremove=""
+
+	if [ "$1" = "/usr/lib/parallels" ]; then
+		echo "Remove Guest Tools 3.x version"
+		daemon="prluserd"
+		sremove="remove"
+	elif [ "$1" = "/usr/lib/parallels-server-tools" ]; then
+		echo "Remove Guest Tools 4.0 RC"
+		daemon="prltoolsd"
+		sremove="unregister"
+	else
+		perror "Error: invalid installation directory: $1"
+		return $E_NOTOOLS
+	fi
+
+	uninstall="$1/uninstall"
+	if [ -x "$uninstall" ]; then
+		"$uninstall"
+	else
+		fdaemon="$1/$daemon"
+		if [ -x "$fdaemon" ]; then
+			echo "Stop Guest Tools service"
+			"$fdaemon" stop
+		fi
+
+		service="$1/iscripts"
+		if [ -x "$service" ]; then
+			echo "Unregister Guest Tools service"
+			iservice="/etc/init.d/$daemon"
+			"$service" $sremove
+			[ -e "$iservice" ] && rm -f "$iservice"
+		fi
+
+		xconf="$1/.xcfg.info"
+		if [ -f "$xconf" ]; then
+			echo "Restore X server configuration"
+			. "$xconf"
+
+			xfile=""
+			if [ -f "$CFGDIR/$LASTCFG" ]; then
+				xfile="$CFGDIR/$CURRCFG"
+				mv "$CFGDIR/$LASTCFG" "$xfile"
+			elif [ -f "$BKPCFG" ]; then
+				xfile="$CURCFG"
+				mv "$BKPCFG" "$xfile"
+			fi
+
+			# Remove X server "fail safe" files
+			rm -f "$xfile."*
+		fi
+
+		evdev="$1/.evdev.info"
+		if [ -f "$evdev" ]; then
+			echo "Restore evdev driver"
+			. "$evdev"
+			fevdev="$1/$EVDEV"
+			[ -f "$fevdev" ] && mv "$fevdev" "$XIDIR/$EVDEV"
+		fi
+
+		itab="$1/.inittab.fc6"
+		if [ -f "$itab" ]; then
+			echo "Restore inittab file"
+			mv -f "$itab" "/etc/inittab"
+		fi
+
+		ilist="$1/.install.lst"
+		if [ -f "$ilist" ]; then
+			echo "Remove Guest Tools modules"
+			cat "$ilist" | while read line; do
+				echo "$line" | tr -d \' | xargs rm -f
+			done
+		fi
+	fi
+
+	echo "Remove $1 directory"
+	rm -rf "$1"
+}
+
+remove_gt4() {
+
+	# Remove user space modules
+	remove_mode='--remove'
+	test $UPDATE_MODE -eq 1 -a "x$1" != "x-f" && remove_mode='--remove-skip-xconf'
+
+	"$INSTALL_TOOLS" "$remove_mode" "$INSTALL_DIR_TOOLS" "$BACKUP_DIR"
+
+	# Get absolute path of base directory
+	pwdir=$(pwd)
+	bdir=$(cd "$BASE_DIR"; pwd)
+	cd "$pwdir"
+
+	# Check... should we completely remove Guest Tools?
+	if ([ "$1" = "-f" ] || [ "$bdir" != "$INSTALL_DIR" ]); then
+		# Remove kernel modules
+		FLAG_REMOVE_ALL="Yes" "$INSTALL_KMODS" --remove "$INSTALL_DIR_KMODS" "$BACKUP_DIR"
+
+		# Backups will be removed only if we are in non-update or force-remove mode
+		if [ "$1" = "-f" -o $UPDATE_MODE -ne 1 ]; then
+			# Remove backup directory
+			rm -rf "$BACKUP_DIR"
+
+			# Finally remove installation directory
+			echo "Remove $INSTALL_DIR directory"
+			rm -rf "$INSTALL_DIR"
+		fi
+	else
+		# Remove kernel modules
+		FLAG_REMOVE_ALL="" "$INSTALL_KMODS" --remove "$INSTALL_DIR_KMODS" "$BACKUP_DIR"
+
+		echo "Skip removal of $INSTALL_DIR directory"
+	fi
+}
+
+remove_gt() {
+	result=$E_NOTOOLS
+	n=0
+
+	[ -f "$MODPROBED_DIR/$BLACKLIST" ] && rm -f "$MODPROBED_DIR/$BLACKLIST"
+	[ -f "$MODPROBED_DIR/$BLACKLIST_OLD" ] && rm -f "$MODPROBED_DIR/$BLACKLIST_OLD"
+	[ -f "$MODPROBE_PRL_ETH_CONF" ] && rm -f "$MODPROBE_PRL_ETH_CONF"
+	if [ -f "$MODPROBE_CONF" ]; then
+		cmds="$ALIAS_NE2K_OFF:$ALIAS_NE2K_OVERRIDE"
+		IFS=':'
+		for cmd in $cmds; do
+			esc_cmd=$(echo $cmd | sed 's/\//\\\//g')
+			grep -q "^\W*$cmd" "$MODPROBE_CONF" && sed -i "/^\W*$esc_cmd/d" "$MODPROBE_CONF"
+		done
+		unset IFS
+	fi
+
+	# Find directory with installed Guest Tools
+	for idir in $INSTALL_DIRS; do
+		if [ -d "$idir" ]; then
+			echo "Found Guest Tools directory: $idir"
+			case "$n" in
+				0) remove_gt4 "$1" ;;
+				# Remove old versions of Guest Tools
+				1 | 2) remove_gt3 "$idir" ;;
+			esac
+			result=$E_NOERROR
+		fi
+		n=$(($n + 1))
+	done
+
+	if [ $result -ne $E_NOERROR ]; then
+		echo "Installed Guest Tools were not found"
+		UPDATE_MODE=0
+	fi
+
+	return $result
+}
+
+unpack_istatus() {
+	local TMP=$(mktemp -d -t prl_XXXXXX)
+	arch=""
+	[ "$(uname -m)" = "x86_64" ] && arch=".x64"
+	tar -xzf "$PRL_INSTALL_CURRENT_DIR/tools/prltools${arch}.tar.gz" -C "$TMP" "./bin/$ISTATUS"
+	echo "$TMP"
+}
+
+call_istatus() {
+	local tmpdir=$1
+	local istatus="$tmpdir/bin/$ISTATUS"
+	local argument=$2
+	local version=$3
+	local error_msg=$4
+
+	[ -x "$istatus" ] && "$istatus" "$argument" "$version" || perror "Error during report about $4."
+	[ "$argument" != 'install_started' -a -d "$tmpdir" ] && rm -rf "$tmpdir"
+
+}
+
+report_uninstalled() {
+	TMP=$(unpack_istatus)
+	call_istatus "$TMP" uninstalled $1 "uninstalled tools version"
+}
+
+remove_guest_tools() {
+	echo ""
+	echo "$(date)"
+	echo "Start removal of Guest Tools"
+
+	[ -e "$INSTALL_DIR/version" ] && ver=$(< "$INSTALL_DIR/version")
+
+	remove_gt -f
+	result=$?
+	[ $result -ne $E_NOERROR ] && return $result
+	
+	[ -z "$ver" ] || report_uninstalled "$ver"
+
+	echo "Parallels Guest Tools were removed successfully!"
+
+	return $E_NOERROR
+}
+
+restore_rclocal() {
+	rclocal=/etc/rc.local
+	rclocal_backup=/etc/rc.local.backup
+
+	test -f "$rclocal" || test -f "$rclocal_backup" || return
+
+	# Try criterias of damaged express installation
+	grep -q 'HOME_DIR' "$rclocal" || return
+	grep -q '^mv /etc/rc.local.backup /etc/rc.local$' "$rclocal" || return
+	grep -q '^reboot$' "$rclocal" || return
+
+	echo "Failed express installation is detected!"
+	echo "Trying to restore /etc/rc.local and other stuff"
+
+	# Here are the commands which were not executed during the end
+	# of express installation. See Ubuntu's part of UnattendedCd lib.
+	mv -f "$rclocal_backup" "$rclocal"
+	mv -f /opt/prl-tools-installer/S*gdm /etc/rc2.d/
+	mv -f /opt/prl-tools-installer/S*kdm /etc/rc2.d/
+	rm -rf /opt/prl-tools-installer
+	mv -f /etc/issue.backup /etc/issue
+}
+
+####################################################################################################
+# Install Guest Tools
+####################################################################################################
+
+install_guest_tools() {
+
+	# Unpack istatus for notification
+	TMP=$(unpack_istatus)
+	if [ -e "$VERSION" ]; then
+		call_istatus "$TMP" install_started  $(<"$VERSION") "start installation of parallels tools"
+	fi
+
+	echo ""
+	echo "$(date)"
+	echo "Start installation or upgrade of Guest Tools"
+
+	if [ -z "$SKIP_RCLOCAL_RESTORE" ]; then
+		restore_rclocal
+	else
+		echo "Restoring rc.local is skipped"
+	fi
+
+	# Switching to update mode
+	# If guest tools are not installed really remove_gt() will set UPDATE_MODE=0
+	UPDATE_MODE=1
+	remove_gt
+
+	result=$?
+	if [ $result -eq $E_NOERROR ]; then
+		echo "Register service to install new Guest Tools"
+		# TODO register service
+	fi
+
+	echo "Perform installation into the $INSTALL_DIR directory"
+	# Create installation directory and copy files
+	mkdir -p "$INSTALL_DIR"
+
+	# Create directory for backup files
+	mkdir -p "$BACKUP_DIR"
+
+	# Install kernel modules
+	cp -Rf "$KMODS_DIR" "$INSTALL_DIR"
+	"$INSTALL_KMODS" --install "$INSTALL_DIR_KMODS" "$BACKUP_DIR"
+	result=$?
+	if [ $result -ne $E_NOERROR ]; then
+		# Compilation of kernel modules is failed so do clean up
+		rm -rf "$INSTALL_DIR"
+		if [ -e "$VERSION" ]; then
+			call_istatus "$TMP" install_failed  $(<"$VERSION") "failed installation of parallels tools"
+		fi
+		return $result
+	fi
+
+	cp -Rf "$INSTALLER_DIR" "$INSTALL_DIR"
+	cp -Rf "$TOOLS_DIR" "$INSTALL_DIR"
+	cp -Rf "$INSTALL" "$INSTALL_DIR"
+	cp -Rf "$VERSION" "$INSTALL_DIR"
+
+	# Install blacklist and override ne2k-pci by our prl_eth
+	if [ -d "$MODPROBED_DIR" ]; then
+		cp -f "$INSTALLER_DIR/$BLACKLIST" "$MODPROBED_DIR"
+		echo "$ALIAS_NE2K_OVERRIDE" > "$MODPROBE_PRL_ETH_CONF"
+	elif [ -f "$MODPROBE_CONF" ]; then
+		echo "$ALIAS_NE2K_OVERRIDE" >> "$MODPROBE_CONF"
+	else
+		echo "$MODPROBE_CONF is missing"
+	fi
+
+	# Install user space applications and drivers
+	install_mode='--install'
+	test $UPDATE_MODE -eq 1 && \
+		"$INSTALL_TOOLS" --check-xconf-patched "$INSTALL_DIR_TOOLS" "$BACKUP_DIR" && \
+			install_mode='--install-skip-xconf'
+	"$INSTALL_TOOLS" "$install_mode" "$INSTALL_DIR_TOOLS" "$BACKUP_DIR"
+	result=$?
+	if [ $result -ne $E_NOERROR ]; then
+		if [ -e "$VERSION" ]; then
+			call_istatus "$TMP" install_failed  $(<"$VERSION") "failed installation of parallels tools"
+		fi
+		return $result
+	fi
+	
+	echo "Send installed Parallels Tools version to dispatcher."
+	if [ -e "$VERSION" ]; then
+		call_istatus "$TMP" installed  $(<"$VERSION") "installed tools version"
+	fi
+
+	echo "Parallels Guest Tools were installed successfully!"
+
+	return $E_NOERROR
+}
+
+####################################################################################################
+# Install, upgrade or remove Guest Tools
+####################################################################################################
+
+# Store current directory for call prl_istatus in uninstall mode
+PRL_INSTALL_CURRENT_DIR=$(pwd)
+export PRL_INSTALL_CURRENT_DIR
+
+if [ $# -eq 0 ]; then
+	check_requirements
+	if [ "$(uname -m)" = "x86_64" ]; then
+		FLAG_CHECK_ASK="Yes" FLAG_CHECK_GUI="Yes" "$GUI_INSTALLER.$X64"
+	else
+		FLAG_CHECK_ASK="Yes" FLAG_CHECK_GUI="Yes" "$GUI_INSTALLER.$X32"
+	fi
+	exit $?
+else
+	if [ $# -eq 0 ]; then
+		perror "Error: wrong number of input parameters [$#]"
+		echo ""
+		usage
+		exit $E_NOARGS
+	fi
+
+	case "$1" in
+		-i | --install | --install-unattended | --force-install | --install-unattended-with-deps)
+			if [[ "$1" = "--install-unattended" || "$1" = "--force-install" ]]; then
+				# Do not ask anything!
+				FLAG_CHECK_ASK=""
+			fi
+			if [[ "$1" = "--install-unattended-with-deps" ]]; then
+				# Do not ask anything and download required packages automatically!
+				FLAG_CHECK_ASK="Download"
+			fi
+			[ "x$2" = "x--skip-rclocal-restore" ] && SKIP_RCLOCAL_RESTORE=1
+			check_restrictions && install_guest_tools >> $LOG 2>&1
+			;;
+
+		-r | --remove)
+			check_requirements
+			remove_guest_tools >> $LOG 2>&1
+			;;
+
+		-v | --version)
+			[ -e "$VERSION" ] || exit $E_NOVER
+			cat "$VERSION"
+			exit $E_NOERROR
+			;;
+
+		-h | --help)
+			usage
+			exit $E_NOERROR
+			;;
+
+		*)
+			perror "Error: wrong input parameter [$1]"
+			echo ""
+			usage
+			exit $E_WARG
+			;;
+	esac
+fi
+
+result=$?
+if [ $result -eq $E_NOERROR ]; then
+	echo "Parallels Guest Tools were installed, upgraded or removed successfully!"
+	echo "Please, reboot your OS to finish installation, upgrade or removal of Guest Tools."
+elif [ $result -eq $E_NOANS ]; then
+	echo "Installation was canceled by user."
+else
+	if [ $result -ne $E_NOPKG -a -z "$FLAG_CHECK_GUI" ]; then # Log is not created if installer failed with error $E_NOPKG
+		perror "Error: failed to install, upgrade or remove Parallels Guest Tools!"
+		[ -f "$LOG" ] && perror "Please, look at $LOG file for more information."
+	fi
+fi
+
+exit $result

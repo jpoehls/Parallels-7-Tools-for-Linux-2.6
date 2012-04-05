@@ -1,0 +1,1 @@
+ACTION=="add", KERNEL=="memory[0-9]*", RUN+="/bin/bash -c 'echo online >/sys/devices/system/memory/%k/state'"

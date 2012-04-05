@@ -1,0 +1,20 @@
+#!/bin/bash
+
+pidfile="/var/run/prltoolsd.pid"
+
+send_signal() {
+	if [ -e "$pidfile" ]; then
+		prlpid=$(cat "$pidfile")
+		kill -SIGUSR1 "$prlpid"
+	fi
+}
+
+case "${1}" in
+	thaw)
+		send_signal
+	;;
+
+	*)
+	;;
+esac
+
